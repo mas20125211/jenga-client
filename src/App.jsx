@@ -31,8 +31,8 @@ const BD = 0.34;   // block depth  (3 × BD + 2 × ROW_GAP ≈ BW)
 const STACK_GAP = 0.001;
 const ROW_GAP   = 0.003;
 const LEVELS    = 18;
-const ROOM_LEN  = 4;
-const TURN_SEC  = 30;
+const ROOM_LEN  = 10;
+const TURN_SEC  = 60;
 
 // Physics — heavy wood, zero bounce
 const GRAVITY     = -12;
