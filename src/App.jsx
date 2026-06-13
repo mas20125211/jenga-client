@@ -38,7 +38,7 @@
  */
 
 import React, {
-  useCallback, useEffect, useMemo, useRef, useState,
+  Suspense, useCallback, useEffect, useMemo, useRef, useState,
 } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls, Environment, Outlines, ContactShadows, Text } from "@react-three/drei";
@@ -281,8 +281,11 @@ function useGyro() {
 
 // ─── Firebase room hook ─────────────────────────────────────────────────────────
 function useFirebaseRoom(myId) {
-  const unsubRef = useRef(null);
-  const snapRef  = useRef(null); // latest snapshot mirror
+  const unsubRef      = useRef(null);
+  const blockUnsubRef = useRef(null);
+  const snapRef       = useRef(null);     // latest snapshot mirror
+  const remoteRef     = useRef({});       // live block transforms from the authority
+                                          // (kept in a ref — updates ~15fps, never re-renders)
 
   const [roomCode,     setRoomCode]     = useState("");
   const [status,       setStatus]       = useState("local");
@@ -313,6 +316,7 @@ function useFirebaseRoom(myId) {
 
   const subscribe = useCallback((code) => {
     unsubRef.current?.();
+    blockUnsubRef.current?.();
     setStatus("connecting");
     const unsub = onValue(ref(db, `rooms/${code}`), (snap) => {
       const data = snap.val();
@@ -321,6 +325,11 @@ function useFirebaseRoom(myId) {
       applySnapshot(data);
     });
     unsubRef.current = unsub;
+    // Separate high-frequency channel for block transforms — kept out of the
+    // room object so a 15fps physics broadcast never re-renders React.
+    blockUnsubRef.current = onValue(ref(db, `blockStates/${code}`), (snap) => {
+      remoteRef.current = snap.val() || {};
+    });
   }, [applySnapshot]);
 
   // Turn order: non-spectators, sorted by joinedAt
@@ -359,11 +368,17 @@ function useFirebaseRoom(myId) {
 
   const leaveRoom = useCallback(() => {
     unsubRef.current?.(); unsubRef.current = null;
+    blockUnsubRef.current?.(); blockUnsubRef.current = null;
     if (roomCode) update(ref(db, `rooms/${roomCode}`), { [`players/${myId}`]: null });
     setRoomCode(""); setStatus("local"); setIsHost(false); setIsSpectator(false);
     setPlayers({}); setCurrentTurn(null); setRemovedIds([]); setLockedBlocks({});
-    setChatMsgs([]); setMatchStats({}); snapRef.current = null;
+    setChatMsgs([]); setMatchStats({}); snapRef.current = null; remoteRef.current = {};
   }, [roomCode, myId]);
+
+  // Authority (turn-holder) broadcasts moved block transforms ~15fps.
+  const pushBlockStates = useCallback((states) => {
+    if (roomCode) update(ref(db, `blockStates/${roomCode}`), states);
+  }, [roomCode]);
 
   const emitPulled = useCallback((blockId) => {
     const data = snapRef.current;
@@ -391,6 +406,8 @@ function useFirebaseRoom(myId) {
 
   const triggerRebuild = useCallback(() => {
     if (!roomCode) return;
+    set(ref(db, `blockStates/${roomCode}`), null);  // drop stale transforms
+    remoteRef.current = {};
     update(ref(db, `rooms/${roomCode}`), {
       removed: {}, locked: {},
       iteration: (snapRef.current?.iteration || 0) + 1,
@@ -414,21 +431,26 @@ function useFirebaseRoom(myId) {
 
   return {
     roomCode, status, isHost, players, currentTurn, removedIds, lockedBlocks,
-    chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator,
+    chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator, remoteRef,
     createRoom, joinRoom, leaveRoom, emitPulled, lockBlock, unlockBlock,
-    sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse,
+    sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse, pushBlockStates,
   };
 }
 
 // ─── Block component ─────────────────────────────────────────────────────────────
+// Physics authority model: the turn-holder (or any solo player) runs the block
+// dynamically and broadcasts its transform. Everyone else keeps the block
+// kinematic and mirrors the broadcast each frame, so all towers are identical.
 const Block = React.memo(function Block({
   block, rbRefs, thawDelay, interactable, lockedByColor, isMineDragging,
+  isAuthority, remoteRef,
 }) {
   const rbRef   = useRef(null);
   const meshRef = useRef(null);
   const [hov, setHov] = useState(false);
   const { map, bump } = wood();
   const tint = useMemo(() => tintFor(block.id), [block.id]);
+  const wentDynamic = useRef(false);
 
   useEffect(() => {
     if (rbRef.current) rbRefs.current.set(block.id, rbRef.current);
@@ -437,10 +459,35 @@ const Block = React.memo(function Block({
 
   useEffect(() => { if (meshRef.current) meshRef.current.userData.blockId = block.id; }, [block.id]);
 
+  // Authority ↔ mirror transitions. Bodytype 0 = dynamic, 2 = kinematicPosition.
   useEffect(() => {
-    const t = setTimeout(() => rbRef.current?.setBodyType(0), thawDelay);
-    return () => clearTimeout(t);
-  }, [thawDelay]);
+    const rb = rbRef.current;
+    if (!rb) return;
+    if (isAuthority) {
+      // Adopt the latest broadcast pose before taking over the sim so the tower
+      // continues from exactly where everyone sees it.
+      const rs = remoteRef?.current?.[block.id];
+      if (rs) {
+        rb.setTranslation({ x: rs.px, y: rs.py, z: rs.pz }, true);
+        rb.setRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 }, true);
+      }
+      // Stagger only the very first settle; later hand-offs go dynamic fast.
+      const delay = (rs || wentDynamic.current) ? 90 : thawDelay;
+      const t = setTimeout(() => { rb.setBodyType(0, true); wentDynamic.current = true; }, delay);
+      return () => clearTimeout(t);
+    }
+    rb.setBodyType(2, true); // kinematic — mirror the authority
+  }, [isAuthority, thawDelay, block.id, remoteRef]);
+
+  // Non-authority: drive the kinematic body to the broadcast transform.
+  useFrame(() => {
+    if (isAuthority) return;
+    const rb = rbRef.current;
+    const rs = remoteRef?.current?.[block.id];
+    if (!rb || !rs) return;
+    rb.setNextKinematicTranslation({ x: rs.px, y: rs.py, z: rs.pz });
+    rb.setNextKinematicRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 });
+  });
 
   if (block.removed) return null;
 
@@ -681,11 +728,42 @@ function Table({ color }) {
   );
 }
 
+// ─── Authority physics broadcaster (turn-holder → everyone, ~15fps) ─────────────
+function AuthoritySync({ rbRefs, blocks, isAuthority, pushBlockStates }) {
+  const frame = useRef(0);
+  const last  = useRef({});
+  useFrame(() => {
+    if (!isAuthority) return;
+    if (++frame.current < 4) return;       // ~15fps at 60fps
+    frame.current = 0;
+    const states = {};
+    let changed = false;
+    blocks.forEach((b) => {
+      if (b.removed) return;
+      const rb = rbRefs.current.get(b.id);
+      if (!rb || rb.bodyType() !== 0) return; // only live dynamic bricks
+      const p = rb.translation(), r = rb.rotation();
+      const ns = {
+        px: +p.x.toFixed(3), py: +p.y.toFixed(3), pz: +p.z.toFixed(3),
+        rx: +r.x.toFixed(4), ry: +r.y.toFixed(4), rz: +r.z.toFixed(4), rw: +r.w.toFixed(4),
+      };
+      const ls = last.current[b.id];
+      if (!ls || Math.abs(ns.px - ls.px) > 0.002 || Math.abs(ns.py - ls.py) > 0.002 ||
+          Math.abs(ns.pz - ls.pz) > 0.002 || Math.abs(ns.ry - ls.ry) > 0.003) {
+        states[b.id] = ns; last.current[b.id] = ns; changed = true;
+      }
+    });
+    if (changed) pushBlockStates(states);
+  });
+  return null;
+}
+
 // ─── 3-D scene ────────────────────────────────────────────────────────────────
 function Scene({
   blocks, rbRefs, thawDelays, settled, gameIteration, gravity, levels,
   envType, active, lockedBlocks, playerColorMap, myId, draggingId,
   onGrab, onRelease, onAnalyticsUpdate, shakeRef, orbitEnabled, setOrbitEnabled, stabRef,
+  isAuthority, remoteRef, pushBlockStates,
 }) {
   const env = ENVS[envType] || ENVS.apartment;
   const ctrlRef = useRef(null);
@@ -696,7 +774,11 @@ function Scene({
     <>
       <color attach="background" args={[env.bg]} />
       <fog attach="fog" args={[env.bg, 18, 48]} />
-      <Environment preset={env.preset} background blur={0.55} />
+      {/* Wrapped so a slow/unavailable HDR never suspends the whole scene
+          (which would freeze the physics frameloop and blank the canvas). */}
+      <Suspense fallback={null}>
+        <Environment preset={env.preset} background blur={0.55} />
+      </Suspense>
 
       {/* Two-sided lighting — no dark angles */}
       <ambientLight intensity={env.amb} />
@@ -730,6 +812,8 @@ function Scene({
             interactable={active && !b.removed}
             lockedByColor={lockedBlocks[b.id] && lockedBlocks[b.id] !== myId ? (playerColorMap[lockedBlocks[b.id]] || "#ffffff") : null}
             isMineDragging={draggingId === b.id}
+            isAuthority={isAuthority}
+            remoteRef={remoteRef}
           />
         ))}
         <DragController
@@ -742,6 +826,7 @@ function Scene({
           setOrbitEnabled={setOrbitEnabled}
           stabRef={stabRef}
         />
+        <AuthoritySync rbRefs={rbRefs} blocks={blocks} isAuthority={isAuthority} pushBlockStates={pushBlockStates} />
         <TowerAnalytics rbRefs={rbRefs} blocks={blocks} totalBlocks={blocks.length} onUpdate={onAnalyticsUpdate} />
       </Physics>
 
@@ -964,9 +1049,9 @@ export default function App() {
 
   const {
     roomCode, status, isHost, players, currentTurn, removedIds, lockedBlocks,
-    chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator,
+    chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator, remoteRef,
     createRoom, joinRoom, leaveRoom, emitPulled, lockBlock, unlockBlock,
-    sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse,
+    sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse, pushBlockStates,
   } = useFirebaseRoom(myId);
 
   const levels  = roomSettings.levels ?? DEFAULT_LEVELS;
@@ -1011,6 +1096,9 @@ export default function App() {
   const myTurn = (!roomCode || currentTurn === myId) && !isSpectator;
   const active = myTurn && settled;
   const turnName = players[currentTurn]?.name ?? currentTurn?.slice(0, 4) ?? "…";
+  // Physics authority = whoever's turn it is (they run the real sim + broadcast).
+  // Solo player is always authority; spectators never are.
+  const isAuthority = (!roomCode || currentTurn === myId) && !isSpectator;
 
   const startSettle = useCallback((lv) => {
     setSettled(false);
@@ -1095,6 +1183,7 @@ export default function App() {
           lockedBlocks={lockedBlocks} playerColorMap={playerColorMap} myId={myId} draggingId={draggingId}
           onGrab={onGrab} onRelease={onRelease} onAnalyticsUpdate={setAnalytics}
           shakeRef={shakeRef} orbitEnabled={orbitEnabled} setOrbitEnabled={setOrbitEnabled} stabRef={stabRef}
+          isAuthority={isAuthority} remoteRef={remoteRef} pushBlockStates={pushBlockStates}
         />
       </Canvas>
 
