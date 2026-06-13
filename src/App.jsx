@@ -468,17 +468,25 @@ const Block = React.memo(function Block({
 
   // Non-authority clients hard-snap each block to the authority's broadcast
   // every frame (teleport + zero velocity). setTranslation/setRotation are safe
-  // on dynamic bodies, so there's no type switch and no crash — and every piece
-  // tracks the authority exactly, so the towers stay identical.
+  // on dynamic bodies, so there's no type switch — and every piece tracks the
+  // authority exactly, so the towers stay identical.
+  //
+  // The try/catch is the crash fix: when a piece is pulled it's removed and its
+  // RigidBody unmounts, and for the single frame between "removed" and the React
+  // unmount this loop could call a Rapier method on a body already torn out of
+  // the world — which throws and takes the whole canvas (both screens) black.
+  // Guarding on block.removed + swallowing a stray frame makes it bulletproof.
   useFrame(() => {
-    if (isAuthority) return;
+    if (isAuthority || block.removed) return;
     const rb = rbRef.current;
     const rs = remoteRef?.current?.[block.id];
     if (!rb || !rs) return;
-    rb.setTranslation({ x: rs.px, y: rs.py, z: rs.pz }, true);
-    rb.setRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 }, true);
-    rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
-    rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    try {
+      rb.setTranslation({ x: rs.px, y: rs.py, z: rs.pz }, true);
+      rb.setRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 }, true);
+      rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    } catch { /* body mid-removal this frame — skip it */ }
   });
 
   if (block.removed) return null;
@@ -668,9 +676,11 @@ function TowerAnalytics({ rbRefs, blocks, totalBlocks, onUpdate }) {
       if (b.removed) return;
       const rb = rbRefs.current.get(b.id);
       if (!rb) return;
-      const p = rb.translation();
-      sumX += p.x; sumZ += p.z; living++;
-      if (rb.bodyType() === 0) { const v = rb.linvel(); sumVel += Math.hypot(v.x, v.y, v.z); dyn++; }
+      try {
+        const p = rb.translation();
+        sumX += p.x; sumZ += p.z; living++;
+        if (rb.bodyType() === 0) { const v = rb.linvel(); sumVel += Math.hypot(v.x, v.y, v.z); dyn++; }
+      } catch { /* body mid-removal this frame — skip it */ }
     });
     if (!living) return;
 
@@ -733,17 +743,20 @@ function AuthoritySync({ rbRefs, blocks, isAuthority, pushBlockStates }) {
     blocks.forEach((b) => {
       if (b.removed) return;
       const rb = rbRefs.current.get(b.id);
-      if (!rb || rb.bodyType() !== 0) return; // only live dynamic bricks
-      const p = rb.translation(), r = rb.rotation();
-      const ns = {
-        px: +p.x.toFixed(3), py: +p.y.toFixed(3), pz: +p.z.toFixed(3),
-        rx: +r.x.toFixed(4), ry: +r.y.toFixed(4), rz: +r.z.toFixed(4), rw: +r.w.toFixed(4),
-      };
-      const ls = last.current[b.id];
-      if (!ls || Math.abs(ns.px - ls.px) > 0.002 || Math.abs(ns.py - ls.py) > 0.002 ||
-          Math.abs(ns.pz - ls.pz) > 0.002 || Math.abs(ns.ry - ls.ry) > 0.003) {
-        states[b.id] = ns; last.current[b.id] = ns; changed = true;
-      }
+      if (!rb) return;
+      try {
+        if (rb.bodyType() !== 0) return; // only live dynamic bricks
+        const p = rb.translation(), r = rb.rotation();
+        const ns = {
+          px: +p.x.toFixed(3), py: +p.y.toFixed(3), pz: +p.z.toFixed(3),
+          rx: +r.x.toFixed(4), ry: +r.y.toFixed(4), rz: +r.z.toFixed(4), rw: +r.w.toFixed(4),
+        };
+        const ls = last.current[b.id];
+        if (!ls || Math.abs(ns.px - ls.px) > 0.002 || Math.abs(ns.py - ls.py) > 0.002 ||
+            Math.abs(ns.pz - ls.pz) > 0.002 || Math.abs(ns.ry - ls.ry) > 0.003) {
+          states[b.id] = ns; last.current[b.id] = ns; changed = true;
+        }
+      } catch { /* body mid-removal this frame — skip it */ }
     });
     if (changed) pushBlockStates(states);
   });
