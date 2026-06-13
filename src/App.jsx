@@ -385,6 +385,7 @@ const Block = React.memo(function Block({
     startX: 0,
     startY: 0,
     moved: false,
+    pointerId: null,
   });
   const tex = woodTex();
   const { camera, gl } = useThree();
@@ -426,7 +427,7 @@ const Block = React.memo(function Block({
       z: hit.z - dragRef.current.offset.z,
     };
 
-    // Kinematic bodies respond more reliably to next-translation updates.
+    // Keep the body where the pointer is while dragging.
     rb.setNextKinematicTranslation(next);
     rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
     rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
@@ -447,6 +448,7 @@ const Block = React.memo(function Block({
     if (!isDragging) return;
 
     if (controlsRef?.current) controlsRef.current.enabled = false;
+    gl.domElement.style.userSelect = "none";
 
     const onMove = (ev) => {
       const dx = ev.clientX - dragRef.current.startX;
@@ -458,7 +460,9 @@ const Block = React.memo(function Block({
     const stopDrag = () => {
       setIsDragging(false);
       if (controlsRef?.current) controlsRef.current.enabled = true;
+      gl.domElement.style.userSelect = "";
       document.body.style.cursor = "default";
+      try { gl.domElement.releasePointerCapture?.(dragRef.current.pointerId); } catch (_) {}
     };
 
     window.addEventListener("pointermove", onMove);
@@ -469,8 +473,9 @@ const Block = React.memo(function Block({
       window.removeEventListener("pointerup", stopDrag);
       window.removeEventListener("pointercancel", stopDrag);
       if (controlsRef?.current) controlsRef.current.enabled = true;
+      gl.domElement.style.userSelect = "";
     };
-  }, [isDragging, moveToPointer, controlsRef]);
+  }, [isDragging, moveToPointer, controlsRef, gl]);
 
   useEffect(() => () => {
     if (document.body.style.cursor === "grabbing") document.body.style.cursor = "default";
@@ -505,18 +510,24 @@ const Block = React.memo(function Block({
         onPointerOver={(e) => {
           e.stopPropagation();
           setHov(true);
-          document.body.style.cursor = isDragging ? "grabbing" : canAct ? "pointer" : "not-allowed";
+          document.body.style.cursor = isDragging ? "grabbing" : (canAct ? "pointer" : "not-allowed");
         }}
         onPointerOut={(e) => {
           e.stopPropagation();
           setHov(false);
-          if (!isDragging) document.body.style.cursor = "default";
+          if (!isDragging) document.body.style.cursor = (canAct && isSelected) ? "pointer" : "default";
         }}
         onPointerDown={(e) => {
           e.stopPropagation();
+          e.nativeEvent?.preventDefault?.();
+          e.nativeEvent?.stopPropagation?.();
+
           if (!canAct || !isSelected || !rbRef.current) return;
 
-          e.target.setPointerCapture?.(e.pointerId);
+          if (controlsRef?.current) controlsRef.current.enabled = false;
+          dragRef.current.pointerId = e.pointerId;
+          gl.domElement.setPointerCapture?.(e.pointerId);
+
           const pos = rbRef.current.translation();
           dragRef.current.offset.set(e.point.x - pos.x, 0, e.point.z - pos.z);
           dragRef.current.y = pos.y;
@@ -533,7 +544,7 @@ const Block = React.memo(function Block({
         onPointerUp={(e) => {
           if (!isDragging) return;
           e.stopPropagation();
-          e.target.releasePointerCapture?.(e.pointerId);
+          try { gl.domElement.releasePointerCapture?.(e.pointerId); } catch (_) {}
         }}
         onClick={(e) => {
           e.stopPropagation();
