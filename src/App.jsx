@@ -58,6 +58,9 @@ const DEFAULT_LEVELS = 18;
 const MAX_LEVELS    = 25;
 const ROOM_LEN      = 10;
 const TURN_SEC      = 60;
+const ROOM_TTL      = 10 * 60 * 1000;   // rooms self-delete 10 min after creation
+const FALL_FRACTION = 0.5;              // >50% of bricks displaced = collapse
+const FALL_DISP     = 0.7;              // metres a brick must leave its last-calm spot to count as fallen
 
 // Physics — heavy wood, zero bounce
 const DEFAULT_GRAVITY = -11;
@@ -122,6 +125,22 @@ const makeCode = () => {
 };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const shortName = (id) => `P-${id.slice(0, 4)}`;
+
+// Where the Nth restacked brick goes — fresh rows of 3 on top of a `levels`-high
+// tower, orientation alternating like the base, dropped from just above to settle.
+function topSlot(placedIndex, levels) {
+  const lvl    = levels + Math.floor(placedIndex / 3);
+  const col    = placedIndex % 3;
+  const alongX = lvl % 2 === 0;
+  const off    = (col - 1) * (BD + ROW_GAP);
+  const ry     = alongX ? 0 : Math.PI / 2;
+  return {
+    x: alongX ? 0 : off,
+    y: BH / 2 + lvl * (BH + STACK_GAP) + 0.14, // a touch above → drops into place
+    z: alongX ? off : 0,
+    quat: { x: 0, y: Math.sin(ry / 2), z: 0, w: Math.cos(ry / 2) },
+  };
+}
 
 // ─── Procedural wood (canvas — colour map + matching bump map) ───────────────────
 // Returns { map, bump } so the grain reads as real depth under the lights.
@@ -300,6 +319,9 @@ function useFirebaseRoom(myId) {
   const [roomSettings, setRoomSettings] = useState({ gravity: DEFAULT_GRAVITY, levels: DEFAULT_LEVELS, password: "" });
   const [matchStats,   setMatchStats]   = useState({});
   const [isSpectator,  setIsSpectator]  = useState(false);
+  const [placed,       setPlaced]       = useState(0);     // blocks restacked on top
+  const [gameOver,     setGameOver]     = useState(null);  // { winnerName, loserName, ... }
+  const [roomGone,     setRoomGone]     = useState(false); // room was deleted out from under us
 
   const applySnapshot = useCallback((data) => {
     snapRef.current = data;
@@ -312,17 +334,25 @@ function useFirebaseRoom(myId) {
     setEnvType(data.envType || "apartment");
     if (data.settings) setRoomSettings((s) => ({ ...s, ...data.settings }));
     setMatchStats(data.stats || {});
+    setPlaced(data.placed || 0);
+    setGameOver(data.gameOver || null);
   }, []);
 
   const subscribe = useCallback((code) => {
     unsubRef.current?.();
     blockUnsubRef.current?.();
-    setStatus("connecting");
+    setStatus("connecting"); setRoomGone(false);
     const unsub = onValue(ref(db, `rooms/${code}`), (snap) => {
       const data = snap.val();
-      if (!data) { setStatus("not found"); return; }
+      if (!data) { setStatus("not found"); setRoomGone(true); return; } // room expired/deleted
       setStatus("online");
       applySnapshot(data);
+      // 10-minute room TTL — any client past the deadline tears the room down
+      // (rooms/{code} holds chat too, so this also clears the chat + blockStates).
+      if (data.createdAt && Date.now() - data.createdAt > ROOM_TTL) {
+        set(ref(db, `rooms/${code}`), null);
+        set(ref(db, `blockStates/${code}`), null);
+      }
     });
     unsubRef.current = unsub;
     // Separate high-frequency channel for block transforms — kept out of the
@@ -344,7 +374,7 @@ function useFirebaseRoom(myId) {
     set(ref(db, `rooms/${code}`), {
       hostId: myId, current: myId, name: name || `${shortName(myId)}'s table`,
       players: { [myId]: { name: shortName(myId), joinedAt: Date.now(), isSpectator: false } },
-      removed: {}, locked: {}, chat: {},
+      removed: {}, locked: {}, chat: {}, placed: 0,
       iteration: 0, envType: "apartment", settings, stats: {}, createdAt: Date.now(),
     });
     setRoomCode(code); setIsHost(true); setIsSpectator(false);
@@ -372,7 +402,8 @@ function useFirebaseRoom(myId) {
     if (roomCode) update(ref(db, `rooms/${roomCode}`), { [`players/${myId}`]: null });
     setRoomCode(""); setStatus("local"); setIsHost(false); setIsSpectator(false);
     setPlayers({}); setCurrentTurn(null); setRemovedIds([]); setLockedBlocks({});
-    setChatMsgs([]); setMatchStats({}); snapRef.current = null; remoteRef.current = {};
+    setChatMsgs([]); setMatchStats({}); setPlaced(0); setGameOver(null); setRoomGone(false);
+    snapRef.current = null; remoteRef.current = {};
   }, [roomCode, myId]);
 
   // Authority (turn-holder) broadcasts moved block transforms ~15fps.
@@ -380,6 +411,8 @@ function useFirebaseRoom(myId) {
     if (roomCode) update(ref(db, `blockStates/${roomCode}`), states);
   }, [roomCode]);
 
+  // A successful pull restacks the brick on top (real Jenga) — no removal.
+  // Advance the turn, bump the placed counter, clear the lock, log a pull.
   const emitPulled = useCallback((blockId) => {
     const data = snapRef.current;
     if (!data || !roomCode) return;
@@ -388,13 +421,25 @@ function useFirebaseRoom(myId) {
     const nextId = order[(idx + 1) % order.length] ?? myId;
     const prevRemovals = data.stats?.[myId]?.removals || 0;
     update(ref(db, `rooms/${roomCode}`), {
-      [`removed/${blockId}`]: true,
       [`locked/${blockId}`]:  null,
       current: nextId,
+      placed: (data.placed || 0) + 1,
       [`stats/${myId}/removals`]: prevRemovals + 1,
       [`stats/${myId}/name`]:     shortName(myId),
     });
   }, [roomCode, myId]);
+
+  // Tower collapsed — record the result for everyone, then self-destruct.
+  const declareGameOver = useCallback((result) => {
+    if (!roomCode || snapRef.current?.gameOver) return; // first detector wins
+    update(ref(db, `rooms/${roomCode}`), { gameOver: { ...result, at: Date.now() } });
+  }, [roomCode]);
+
+  const deleteRoom = useCallback(() => {
+    if (!roomCode) return;
+    set(ref(db, `rooms/${roomCode}`), null);
+    set(ref(db, `blockStates/${roomCode}`), null);
+  }, [roomCode]);
 
   const lockBlock   = useCallback((id) => { if (roomCode) update(ref(db, `rooms/${roomCode}/locked`), { [id]: myId }); }, [roomCode, myId]);
   const unlockBlock = useCallback((id) => { if (roomCode) update(ref(db, `rooms/${roomCode}/locked`), { [id]: null }); }, [roomCode]);
@@ -409,7 +454,7 @@ function useFirebaseRoom(myId) {
     set(ref(db, `blockStates/${roomCode}`), null);  // drop stale transforms
     remoteRef.current = {};
     update(ref(db, `rooms/${roomCode}`), {
-      removed: {}, locked: {},
+      removed: {}, locked: {}, placed: 0, gameOver: null,
       iteration: (snapRef.current?.iteration || 0) + 1,
       current: turnOrder(snapRef.current)[0] || myId,
     });
@@ -432,8 +477,10 @@ function useFirebaseRoom(myId) {
   return {
     roomCode, status, isHost, players, currentTurn, removedIds, lockedBlocks,
     chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator, remoteRef,
+    placed, gameOver, roomGone,
     createRoom, joinRoom, leaveRoom, emitPulled, lockBlock, unlockBlock,
     sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse, pushBlockStates,
+    declareGameOver, deleteRoom,
   };
 }
 
@@ -715,6 +762,35 @@ function CameraShake({ triggerRef }) {
   return null;
 }
 
+// ─── Fall detector (authority/local only) ───────────────────────────────────────
+// Tracks each brick's last *calm* position as its "home". A brick counts as
+// fallen once it's drifted FALL_DISP from home while moving. When more than
+// FALL_FRACTION of the standing bricks are fallen, the tower has collapsed.
+function FallDetector({ rbRefs, blocks, armed, onCollapse }) {
+  const homes = useRef({});
+  const fired = useRef(false);
+  useFrame(() => {
+    if (!armed) { fired.current = false; return; } // disarm between games
+    if (fired.current) return;
+    let living = 0, fallen = 0;
+    blocks.forEach((b) => {
+      if (b.removed) return;
+      const rb = rbRefs.current.get(b.id);
+      if (!rb) return;
+      living++;
+      try {
+        const p = rb.translation(), v = rb.linvel();
+        const speed = Math.hypot(v.x, v.y, v.z);
+        const h = homes.current[b.id];
+        if (!h || speed < 0.25) { homes.current[b.id] = { x: p.x, y: p.y, z: p.z }; return; }
+        if (Math.hypot(p.x - h.x, p.y - h.y, p.z - h.z) > FALL_DISP) fallen++;
+      } catch { /* mid-removal — skip */ }
+    });
+    if (living >= 6 && fallen / living > FALL_FRACTION) { fired.current = true; onCollapse(); }
+  });
+  return null;
+}
+
 // ─── Floor ──────────────────────────────────────────────────────────────────────
 function Table({ color }) {
   return (
@@ -768,7 +844,7 @@ function Scene({
   blocks, rbRefs, thawDelays, settled, gameIteration, gravity, levels,
   envType, active, lockedBlocks, playerColorMap, myId, draggingId,
   onGrab, onRelease, onAnalyticsUpdate, shakeRef, orbitEnabled, setOrbitEnabled, stabRef,
-  isAuthority, remoteRef, pushBlockStates,
+  isAuthority, remoteRef, pushBlockStates, onCollapse,
 }) {
   const env = ENVS[envType] || ENVS.apartment;
   const ctrlRef = useRef(null);
@@ -832,6 +908,7 @@ function Scene({
           stabRef={stabRef}
         />
         <AuthoritySync rbRefs={rbRefs} blocks={blocks} isAuthority={isAuthority} pushBlockStates={pushBlockStates} />
+        <FallDetector rbRefs={rbRefs} blocks={blocks} armed={isAuthority && settled} onCollapse={onCollapse} />
         <TowerAnalytics rbRefs={rbRefs} blocks={blocks} totalBlocks={blocks.length} onUpdate={onAnalyticsUpdate} />
       </Physics>
 
@@ -1098,6 +1175,7 @@ function useRoomList() {
   useEffect(() => {
     const unsub = onValue(ref(db, "rooms"), (snap) => {
       const data = snap.val() || {};
+      const now = Date.now();
       setRooms(
         Object.entries(data)
           .map(([code, r]) => ({
@@ -1107,7 +1185,14 @@ function useRoomList() {
             locked: !!r?.settings?.password,
             createdAt: r?.createdAt || 0,
           }))
-          .filter((r) => r.players > 0)
+          .filter((r) => {
+            if (r.createdAt && now - r.createdAt > ROOM_TTL) { // expired — clean it up
+              set(ref(db, `rooms/${r.code}`), null);
+              set(ref(db, `blockStates/${r.code}`), null);
+              return false;
+            }
+            return r.players > 0;
+          })
           .sort((a, b) => b.createdAt - a.createdAt)
           .slice(0, 25),
       );
@@ -1168,8 +1253,10 @@ export default function App() {
   const {
     roomCode, status, isHost, players, currentTurn, removedIds, lockedBlocks,
     chatMsgs, gameIteration, envType, roomSettings, matchStats, isSpectator, remoteRef,
+    placed, gameOver, roomGone,
     createRoom, joinRoom, leaveRoom, emitPulled, lockBlock, unlockBlock,
     sendChat, triggerRebuild, changeEnv, updateSettings, recordCollapse, pushBlockStates,
+    declareGameOver, deleteRoom,
   } = useFirebaseRoom(myId);
 
   const levels  = roomSettings.levels ?? DEFAULT_LEVELS;
@@ -1182,6 +1269,9 @@ export default function App() {
   const [analytics, setAnalytics]       = useState({ risk: 0, lean: 0, avgVel: 0, instability: 0 });
   const [draggingId, setDraggingId]     = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [localPlaced, setLocalPlaced]   = useState(0);    // restacked count (local mode)
+  const [localGameOver, setLocalGameOver] = useState(null);
+  const [localIter, setLocalIter]       = useState(0);    // bump to rebuild the local tower (forces remount)
 
   // Collapsible side menus — auto-collapse on narrow/mobile screens
   const isMobile = useMemo(() => typeof window !== "undefined" && window.innerWidth < 720, []);
@@ -1218,11 +1308,14 @@ export default function App() {
   const isLocal = view === "local";
   const inGame  = isLocal || (view === "online" && !!roomCode);
 
+  const effPlaced   = isLocal ? localPlaced : placed;
+  const effGameOver = isLocal ? localGameOver : gameOver;
+
   // Local pass-and-play: it's always "your turn" (the device is shared); online:
   // my turn in the room (not spectating). Authority/active derive from these.
   const onlineMyTurn = (currentTurn === myId) && !isSpectator;
   const myTurn = isLocal ? true : onlineMyTurn;
-  const active = inGame && myTurn && settled;
+  const active = inGame && myTurn && settled && !effGameOver;
   const turnName = isLocal
     ? (localPlayers[localTurn] || "Player")
     : (players[currentTurn]?.name ?? currentTurn?.slice(0, 4) ?? "…");
@@ -1237,12 +1330,12 @@ export default function App() {
 
   useEffect(() => { startSettle(DEFAULT_LEVELS); }, [startSettle]);
 
-  // Rebuild when iteration or level count changes
+  // Rebuild when iteration (online), localIter (local rebuild), or levels change
   useEffect(() => {
     setBlocks(buildBlocks(levels));
     setDraggingId(null);
     startSettle(levels);
-  }, [gameIteration, levels, startSettle]);
+  }, [gameIteration, localIter, levels, startSettle]);
 
   // Apply removed blocks from Firebase (online only — local manages its own)
   useEffect(() => {
@@ -1279,26 +1372,77 @@ export default function App() {
   const onRelease = useCallback((blockId, wasPulled) => {
     setDraggingId(null);
     if (wasPulled) {
-      setBlocks((p) => p.map((b) => b.id === blockId ? { ...b, removed: true } : b)); // optimistic
       playPull();
-      if (isLocal) { setLocalTurn((t) => (localPlayers.length ? (t + 1) % localPlayers.length : 0)); setTimeLeft(TURN_SEC); }
-      else if (roomCode) emitPulled(blockId);
-      else setTimeLeft(TURN_SEC);
+      // Real Jenga: restack the pulled brick on top. The turn-holder (authority)
+      // teleports it to the next top slot to drop into place.
+      const slot = topSlot(effPlaced, levels);
+      const rb = rbRefs.current.get(blockId);
+      if (rb) {
+        try {
+          rb.setTranslation({ x: slot.x, y: slot.y, z: slot.z }, true);
+          rb.setRotation(slot.quat, true);
+          rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        } catch { /* body gone — ignore */ }
+      }
+      if (isLocal) {
+        setLocalPlaced((n) => n + 1);
+        setLocalTurn((t) => (localPlayers.length ? (t + 1) % localPlayers.length : 0));
+        setTimeLeft(TURN_SEC);
+      } else if (roomCode) {
+        // Broadcast the new top position now, before the turn handoff, so the
+        // placement survives losing authority (and the next player drops it in).
+        pushBlockStates({ [blockId]: { px: slot.x, py: slot.y, pz: slot.z, rx: slot.quat.x, ry: slot.quat.y, rz: slot.quat.z, rw: slot.quat.w } });
+        emitPulled(blockId);
+      } else setTimeLeft(TURN_SEC);
     } else if (!isLocal) {
       unlockBlock(blockId);
     }
-  }, [isLocal, localPlayers.length, roomCode, emitPulled, unlockBlock, playPull]);
+  }, [isLocal, localPlayers.length, roomCode, emitPulled, unlockBlock, playPull, pushBlockStates, effPlaced, levels, rbRefs]);
+
+  // ── Collapse → announce winner, then self-destruct (online) / show locally ──
+  const onCollapse = useCallback(() => {
+    if (isLocal) {
+      const loserI = localTurn;
+      const winnerI = localPlayers.length ? (loserI - 1 + localPlayers.length) % localPlayers.length : 0;
+      setLocalGameOver({ loserName: localPlayers[loserI] || "Player", winnerName: localPlayers[winnerI] || "Player" });
+      playCrash(); shakeRef.current?.(1.0);
+    } else if (roomCode) {
+      const order = Object.entries(players).filter(([, p]) => p && !p.isSpectator)
+        .sort(([, a], [, b]) => (a.joinedAt || 0) - (b.joinedAt || 0)).map(([id]) => id);
+      const idx = order.indexOf(currentTurn);
+      const loserId  = currentTurn;
+      const winnerId = order.length > 1 ? order[(idx - 1 + order.length) % order.length] : currentTurn;
+      declareGameOver({
+        loserId, winnerId,
+        loserName:  players[loserId]?.name || "Player",
+        winnerName: players[winnerId]?.name || "Player",
+      });
+      playCrash(); shakeRef.current?.(1.0);
+    }
+  }, [isLocal, localTurn, localPlayers, roomCode, players, currentTurn, declareGameOver, playCrash]);
 
   // ── View / mode actions ──
   const startLocal = useCallback((names) => {
-    setLocalPlayers(names); setLocalTurn(0); setView("local");
-    setBlocks(buildBlocks(DEFAULT_LEVELS)); setDraggingId(null); startSettle(DEFAULT_LEVELS);
-  }, [startSettle]);
+    setLocalPlayers(names); setLocalTurn(0); setLocalPlaced(0); setLocalGameOver(null); setView("local");
+    setLocalIter((n) => n + 1); // forces a fresh tower remount
+  }, []);
   const exitToTitle = useCallback(() => {
     if (roomCode) leaveRoom();
-    setView("title"); setLocalPlayers([]); setLocalTurn(0);
+    setView("title"); setLocalPlayers([]); setLocalTurn(0); setLocalPlaced(0); setLocalGameOver(null);
     setBlocks(buildBlocks(DEFAULT_LEVELS)); startSettle(DEFAULT_LEVELS);
   }, [roomCode, leaveRoom, startSettle]);
+
+  // When my room is deleted out from under me (TTL or self-destruct), bail to title.
+  useEffect(() => { if (roomGone) exitToTitle(); }, [roomGone, exitToTitle]);
+
+  // After a collapse, the host deletes the room ~7s later; every other client
+  // gets the room-gone signal and bails to title automatically.
+  useEffect(() => {
+    if (!gameOver || !roomCode || !isHost) return;
+    const t = setTimeout(() => deleteRoom(), 7000);
+    return () => clearTimeout(t);
+  }, [gameOver, roomCode, isHost, deleteRoom]);
 
   // ── Lobby actions ──
   const onCreate = useCallback((name = "", password = "") => { createRoom(makeCode(), name, { password }); }, [createRoom]);
@@ -1338,7 +1482,7 @@ export default function App() {
             ))}
           </div>
           <button style={{ ...btn, background: "#7f1d1d", color: "#fca5a5", marginBottom: 7 }}
-            onClick={() => { setBlocks(buildBlocks(DEFAULT_LEVELS)); setDraggingId(null); startSettle(DEFAULT_LEVELS); }}>↺ Rebuild Tower</button>
+            onClick={() => { setLocalPlaced(0); setLocalGameOver(null); setLocalIter((n) => n + 1); }}>↺ Rebuild Tower</button>
           <button style={{ ...btn, background: "#333", color: "#aaa" }} onClick={exitToTitle}>⏏ Exit to title</button>
         </div>
       ) : (
@@ -1347,12 +1491,12 @@ export default function App() {
 
       <Canvas shadows camera={{ position: [7, 9.5, 9], fov: 44 }} style={{ position: "absolute", inset: 0, zIndex: 0 }} gl={{ antialias: true }}>
         <Scene
-          blocks={blocks} rbRefs={rbRefs} thawDelays={thawDelays} settled={settled} gameIteration={gameIteration}
+          blocks={blocks} rbRefs={rbRefs} thawDelays={thawDelays} settled={settled} gameIteration={`${gameIteration}-${localIter}`}
           gravity={gravity} levels={levels} envType={envType} active={active}
           lockedBlocks={lockedBlocks} playerColorMap={playerColorMap} myId={myId} draggingId={draggingId}
           onGrab={onGrab} onRelease={onRelease} onAnalyticsUpdate={setAnalytics}
           shakeRef={shakeRef} orbitEnabled={orbitEnabled} setOrbitEnabled={setOrbitEnabled} stabRef={stabRef}
-          isAuthority={isAuthority} remoteRef={remoteRef} pushBlockStates={pushBlockStates}
+          isAuthority={isAuthority} remoteRef={remoteRef} pushBlockStates={pushBlockStates} onCollapse={onCollapse}
         />
       </Canvas>
 
@@ -1366,12 +1510,31 @@ export default function App() {
 
       {showSettings && <SettingsModal settings={roomSettings} onSave={updateSettings} onClose={() => setShowSettings(false)} isHost={isHost} />}
 
-      {inGame && !settled && (
+      {inGame && !settled && !effGameOver && (
         <div style={ovl}>
           <div style={ovlBox}>
             <div style={ovlTitle}>Stacking blocks…</div>
             <div style={ovlTrack}><div style={{ ...ovlFill, animationDuration: `${settleMs(levels) / 1000}s` }} /></div>
             <div style={{ fontSize: 12, opacity: 0.4, marginTop: 8 }}>Physics settling</div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Collapse / winner ── */}
+      {effGameOver && (
+        <div style={ovl}>
+          <div style={{ ...ovlBox, width: 300 }}>
+            <div style={{ fontSize: 30, marginBottom: 6 }}>🏆</div>
+            <div style={{ fontSize: 22, fontWeight: 900, color: "#4ade80", marginBottom: 6 }}>{effGameOver.winnerName} wins!</div>
+            <div style={{ fontSize: 13, color: "#f87171", marginBottom: 16 }}>{effGameOver.loserName} knocked the tower down 💥</div>
+            {isLocal ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={btn} onClick={() => startLocal(localPlayers)}>Play again</button>
+                <button style={{ ...btn, background: "#333", color: "#aaa" }} onClick={exitToTitle}>Title</button>
+              </div>
+            ) : (
+              <div style={{ fontSize: 12, color: "#888" }}>Room closing…</div>
+            )}
           </div>
         </div>
       )}
