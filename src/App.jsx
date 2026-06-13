@@ -450,7 +450,6 @@ const Block = React.memo(function Block({
   const [hov, setHov] = useState(false);
   const { map, bump } = wood();
   const tint = useMemo(() => tintFor(block.id), [block.id]);
-  const wentDynamic = useRef(false);
 
   useEffect(() => {
     if (rbRef.current) rbRefs.current.set(block.id, rbRef.current);
@@ -459,34 +458,27 @@ const Block = React.memo(function Block({
 
   useEffect(() => { if (meshRef.current) meshRef.current.userData.blockId = block.id; }, [block.id]);
 
-  // Authority ↔ mirror transitions. Bodytype 0 = dynamic, 2 = kinematicPosition.
+  // Every block stays DYNAMIC for everyone — we never switch body types (doing
+  // so mid-turn-change was calling kinematic methods on a dynamic body and
+  // crashing Rapier → black screen). Thaw to dynamic once after the settle.
   useEffect(() => {
-    const rb = rbRef.current;
-    if (!rb) return;
-    if (isAuthority) {
-      // Adopt the latest broadcast pose before taking over the sim so the tower
-      // continues from exactly where everyone sees it.
-      const rs = remoteRef?.current?.[block.id];
-      if (rs) {
-        rb.setTranslation({ x: rs.px, y: rs.py, z: rs.pz }, true);
-        rb.setRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 }, true);
-      }
-      // Stagger only the very first settle; later hand-offs go dynamic fast.
-      const delay = (rs || wentDynamic.current) ? 90 : thawDelay;
-      const t = setTimeout(() => { rb.setBodyType(0, true); wentDynamic.current = true; }, delay);
-      return () => clearTimeout(t);
-    }
-    rb.setBodyType(2, true); // kinematic — mirror the authority
-  }, [isAuthority, thawDelay, block.id, remoteRef]);
+    const t = setTimeout(() => rbRef.current?.setBodyType(0), thawDelay);
+    return () => clearTimeout(t);
+  }, [thawDelay]);
 
-  // Non-authority: drive the kinematic body to the broadcast transform.
+  // Non-authority clients hard-snap each block to the authority's broadcast
+  // every frame (teleport + zero velocity). setTranslation/setRotation are safe
+  // on dynamic bodies, so there's no type switch and no crash — and every piece
+  // tracks the authority exactly, so the towers stay identical.
   useFrame(() => {
     if (isAuthority) return;
     const rb = rbRef.current;
     const rs = remoteRef?.current?.[block.id];
     if (!rb || !rs) return;
-    rb.setNextKinematicTranslation({ x: rs.px, y: rs.py, z: rs.pz });
-    rb.setNextKinematicRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 });
+    rb.setTranslation({ x: rs.px, y: rs.py, z: rs.pz }, true);
+    rb.setRotation({ x: rs.rx, y: rs.ry, z: rs.rz, w: rs.rw ?? 1 }, true);
+    rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
   });
 
   if (block.removed) return null;
