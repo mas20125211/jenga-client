@@ -123,45 +123,70 @@ const makeCode = () => {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const shortName = (id) => `P-${id.slice(0, 4)}`;
 
-// ─── Procedural wood texture (canvas — no external files) ───────────────────────
-function makeWoodTexture() {
-  const C = document.createElement("canvas");
-  C.width = 256; C.height = 128;
-  const ctx = C.getContext("2d");
+// ─── Procedural wood (canvas — colour map + matching bump map) ───────────────────
+// Returns { map, bump } so the grain reads as real depth under the lights.
+function makeWood() {
+  const W = 512, H = 256;
+  const col = document.createElement("canvas"); col.width = W; col.height = H;
+  const bmp = document.createElement("canvas"); bmp.width = W; bmp.height = H;
+  const c = col.getContext("2d"), b = bmp.getContext("2d");
 
-  const g = ctx.createLinearGradient(0, 0, 256, 0);
-  g.addColorStop(0, "#a05828"); g.addColorStop(0.3, "#c47a3a");
-  g.addColorStop(0.6, "#d48848"); g.addColorStop(1, "#b06030");
-  ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 128);
+  // Base: warm maple, gradient along the length
+  const g = c.createLinearGradient(0, 0, W, 0);
+  g.addColorStop(0, "#b06a34"); g.addColorStop(0.25, "#caa066");
+  g.addColorStop(0.5, "#d8b070"); g.addColorStop(0.75, "#c89456"); g.addColorStop(1, "#b06a34");
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+  b.fillStyle = "#808080"; b.fillRect(0, 0, W, H); // neutral bump base
 
-  for (let i = 0; i < 38; i++) {                       // long grain
-    ctx.beginPath();
-    ctx.strokeStyle = `rgba(0,0,0,${0.03 + Math.random() * 0.14})`;
-    ctx.lineWidth = 0.4 + Math.random() * 1.1;
-    let y = Math.random() * 128;
-    ctx.moveTo(0, y);
-    for (let x = 0; x < 256; x += 6) { y += (Math.random() - 0.5) * 2.4; ctx.lineTo(x, y); }
-    ctx.stroke();
+  // Long flowing grain lines (drawn into both colour + bump)
+  for (let i = 0; i < 70; i++) {
+    const dark = 0.04 + Math.random() * 0.16;
+    const baseY = Math.random() * H;
+    const amp = 3 + Math.random() * 9, freq = 0.004 + Math.random() * 0.01;
+    const lw = 0.5 + Math.random() * 1.6;
+    c.beginPath(); b.beginPath();
+    c.strokeStyle = `rgba(60,30,10,${dark})`; c.lineWidth = lw;
+    b.strokeStyle = `rgba(40,40,40,${dark * 1.6})`; b.lineWidth = lw;
+    for (let x = 0; x <= W; x += 4) {
+      const y = baseY + Math.sin(x * freq + i) * amp;
+      if (x === 0) { c.moveTo(x, y); b.moveTo(x, y); } else { c.lineTo(x, y); b.lineTo(x, y); }
+    }
+    c.stroke(); b.stroke();
   }
-  for (let k = 0; k < 3; k++) {                         // knots
-    const kx = 20 + Math.random() * 216, ky = 8 + Math.random() * 112;
-    const rg = ctx.createRadialGradient(kx, ky, 0, kx, ky, 14);
-    rg.addColorStop(0, "rgba(55,25,5,0.75)"); rg.addColorStop(0.5, "rgba(80,40,10,0.30)");
-    rg.addColorStop(1, "rgba(80,40,10,0)");
-    ctx.fillStyle = rg;
-    ctx.beginPath(); ctx.ellipse(kx, ky, 14, 7, Math.random() * Math.PI, 0, Math.PI * 2); ctx.fill();
+  // Fine speckle for a tactile surface
+  for (let i = 0; i < 2600; i++) {
+    const x = Math.random() * W, y = Math.random() * H, a = Math.random() * 0.06;
+    c.fillStyle = `rgba(50,25,8,${a})`; c.fillRect(x, y, 1, 1);
+    b.fillStyle = `rgba(90,90,90,${a * 2})`; b.fillRect(x, y, 1, 1);
   }
-  const hl = ctx.createLinearGradient(0, 0, 0, 128);    // top-light bevel
-  hl.addColorStop(0, "rgba(255,255,255,0.07)"); hl.addColorStop(0.45, "rgba(255,255,255,0)");
-  hl.addColorStop(1, "rgba(0,0,0,0.09)");
-  ctx.fillStyle = hl; ctx.fillRect(0, 0, 256, 128);
+  // A couple of knots
+  for (let k = 0; k < 2; k++) {
+    const kx = 40 + Math.random() * (W - 80), ky = 20 + Math.random() * (H - 40);
+    const rg = c.createRadialGradient(kx, ky, 0, kx, ky, 22);
+    rg.addColorStop(0, "rgba(70,35,12,0.8)"); rg.addColorStop(0.5, "rgba(90,50,18,0.3)"); rg.addColorStop(1, "rgba(90,50,18,0)");
+    c.fillStyle = rg; c.beginPath(); c.ellipse(kx, ky, 22, 11, Math.random() * Math.PI, 0, Math.PI * 2); c.fill();
+  }
 
-  const tex = new THREE.CanvasTexture(C);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  return tex;
+  const map  = new THREE.CanvasTexture(col);
+  const bump = new THREE.CanvasTexture(bmp);
+  for (const t of [map, bump]) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; }
+  return { map, bump };
 }
-let _woodTex = null;
-const woodTex = () => (_woodTex ||= makeWoodTexture());
+let _wood = null;
+const wood = () => (_wood ||= makeWood());
+
+// Stable per-block tone variation so the set looks like real, slightly-mismatched
+// wood instead of 54 identical clones. Hash the id → small hue/lightness shift.
+function tintFor(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) & 0xffff;
+  const r = (h % 100) / 100;                    // 0..1 deterministic
+  const light = 0.82 + r * 0.30;                // 0.82..1.12 brightness
+  const warm  = 1 + ((h >> 4) % 100) / 100 * 0.12 - 0.06;
+  const cl = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  const base = [212, 146, 78];                  // #d4924e
+  return `rgb(${cl(base[0] * light * warm)},${cl(base[1] * light)},${cl(base[2] * light / warm)})`;
+}
 
 // ─── Web Audio SFX (no external files) ─────────────────────────────────────────
 function useAudio() {
@@ -402,7 +427,8 @@ const Block = React.memo(function Block({
   const rbRef   = useRef(null);
   const meshRef = useRef(null);
   const [hov, setHov] = useState(false);
-  const tex = woodTex();
+  const { map, bump } = wood();
+  const tint = useMemo(() => tintFor(block.id), [block.id]);
 
   useEffect(() => {
     if (rbRef.current) rbRefs.current.set(block.id, rbRef.current);
@@ -419,12 +445,15 @@ const Block = React.memo(function Block({
   if (block.removed) return null;
 
   const canHover = interactable && !lockedByColor;
-  // Visual priority: me dragging (red) → locked by other (their colour) → hover
-  const showOutline = isMineDragging || !!lockedByColor || (hov && canHover);
-  const outlineClr  = isMineDragging ? "#ff4d4d" : lockedByColor ?? "#ffffff";
-  const outlineW    = isMineDragging ? 0.03 : lockedByColor ? 0.022 : 0.014;
-  const emissive    = isMineDragging ? "#5a0c0c" : hov && canHover ? "#2a1005" : "#000000";
-  const emissiveI   = isMineDragging ? 0.55 : hov && canHover ? 0.25 : 0;
+  // Highlight priority: I'm holding it (bright gold) → someone else holds it
+  // (their colour) → I'm hovering a pullable one (amber). Made deliberately
+  // loud so it's unmistakable which block you're about to pull.
+  const grabbed = isMineDragging;
+  const showOutline = grabbed || !!lockedByColor || (hov && canHover);
+  const outlineClr  = grabbed ? "#ffe24a" : lockedByColor ?? "#fff2c0";
+  const outlineW    = grabbed ? 0.05 : lockedByColor ? 0.03 : 0.025;
+  const emissive    = grabbed ? "#ffb020" : lockedByColor ? lockedByColor : (hov && canHover ? "#ff8c2a" : "#000000");
+  const emissiveI   = grabbed ? 0.9 : lockedByColor ? 0.35 : (hov && canHover ? 0.45 : 0);
 
   return (
     <RigidBody
@@ -449,12 +478,15 @@ const Block = React.memo(function Block({
       >
         <boxGeometry args={[BW, BH, BD]} />
         <meshStandardMaterial
-          map={tex}
-          color="#c47a3a"
+          map={map}
+          bumpMap={bump}
+          bumpScale={0.6}
+          color={tint}
           emissive={emissive}
           emissiveIntensity={emissiveI}
-          roughness={0.78}
-          metalness={0.04}
+          roughness={0.62}
+          metalness={0.0}
+          envMapIntensity={0.7}
         />
         {showOutline && <Outlines thickness={outlineW} color={outlineClr} />}
       </mesh>
@@ -463,7 +495,7 @@ const Block = React.memo(function Block({
 });
 
 // ─── Drag controller (spring-force pull) ────────────────────────────────────────
-function DragController({ rbRefs, blocks, settled, active, onGrab, onRelease, setOrbitEnabled }) {
+function DragController({ rbRefs, blocks, settled, active, onGrab, onRelease, setOrbitEnabled, stabRef }) {
   const { camera, gl, scene } = useThree();
   const drag     = useRef(null);
   const ptr      = useRef(new THREE.Vector2());
@@ -556,12 +588,29 @@ function DragController({ rbRefs, blocks, settled, active, onGrab, onRelease, se
     ray.current.setFromCamera(ptr.current, camera);
     if (!ray.current.ray.intersectPlane(plane, hitPt.current)) return;
     const pos = rb.translation(), vel = rb.linvel();
-    const dx = hitPt.current.x - pos.x, dz = hitPt.current.z - pos.z;
+    // Pull toward the full 3-D pointer target — X, Z AND Y. Following the
+    // vertical too means a careless yank lifts/tilts the block so it scrapes
+    // and shoves its neighbours, instead of sliding out on a clean rail.
+    const dx = hitPt.current.x - pos.x;
+    const dy = hitPt.current.y - pos.y;
+    const dz = hitPt.current.z - pos.z;
     let fx = dx * SPRING_K - vel.x * DRAG_DAMP;
+    let fy = dy * SPRING_K * 0.7 - vel.y * DRAG_DAMP;
     let fz = dz * SPRING_K - vel.z * DRAG_DAMP;
-    const fy = -vel.y * 12;
-    const mag = Math.hypot(fx, fz);
-    if (mag > MAX_FORCE) { const s = MAX_FORCE / mag; fx *= s; fz *= s; }
+
+    // Gyro: shaky hands (low stability) add random hand-tremor to the pull, so
+    // an unsteady phone makes a clean extraction much harder — real Jenga nerves.
+    const stab = stabRef?.current ?? 100;
+    const wob = (100 - stab) / 100;            // 0 steady … 1 shaking
+    if (wob > 0.02) {
+      const J = wob * 9;
+      fx += (Math.random() - 0.5) * J;
+      fy += (Math.random() - 0.5) * J * 0.6;
+      fz += (Math.random() - 0.5) * J;
+    }
+
+    const mag = Math.hypot(fx, fy, fz);
+    if (mag > MAX_FORCE) { const s = MAX_FORCE / mag; fx *= s; fy *= s; fz *= s; }
     rb.applyImpulse({ x: fx * 0.016, y: fy * 0.016, z: fz * 0.016 }, true);
     rb.wakeUp();
   });
@@ -636,7 +685,7 @@ function Table({ color }) {
 function Scene({
   blocks, rbRefs, thawDelays, settled, gameIteration, gravity, levels,
   envType, active, lockedBlocks, playerColorMap, myId, draggingId,
-  onGrab, onRelease, onAnalyticsUpdate, shakeRef, orbitEnabled, setOrbitEnabled,
+  onGrab, onRelease, onAnalyticsUpdate, shakeRef, orbitEnabled, setOrbitEnabled, stabRef,
 }) {
   const env = ENVS[envType] || ENVS.apartment;
   const ctrlRef = useRef(null);
@@ -691,6 +740,7 @@ function Scene({
           onGrab={onGrab}
           onRelease={onRelease}
           setOrbitEnabled={setOrbitEnabled}
+          stabRef={stabRef}
         />
         <TowerAnalytics rbRefs={rbRefs} blocks={blocks} totalBlocks={blocks.length} onUpdate={onAnalyticsUpdate} />
       </Physics>
@@ -717,7 +767,7 @@ function MeterBar({ label, val, color }) {
   );
 }
 
-function HUD({ analytics, stab, needsBtn, requestGyro, myTurn, timeLeft, settled, turnName }) {
+function HUD({ analytics, stab, needsBtn, requestGyro, myTurn, timeLeft, settled, turnName, onCollapse }) {
   const { risk, lean, instability } = analytics;
   const pct = Math.round(stab);
   const stabClr = pct > 66 ? "#4ade80" : pct > 33 ? "#fbbf24" : "#f87171";
@@ -726,9 +776,12 @@ function HUD({ analytics, stab, needsBtn, requestGyro, myTurn, timeLeft, settled
 
   return (
     <div style={hud}>
-      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10, color: myTurn ? "#4ade80" : "#f0d090" }}>
-        {myTurn ? "✦ YOUR TURN" : `${turnName}'s turn`}
-        <span style={{ float: "right", color: timeLeft < 8 ? "#f87171" : "#aaa", fontWeight: 800 }}>{timeLeft}s</span>
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10, color: myTurn ? "#4ade80" : "#f0d090", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span>{myTurn ? "✦ YOUR TURN" : `${turnName}'s turn`}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ color: timeLeft < 8 ? "#f87171" : "#aaa", fontWeight: 800 }}>{timeLeft}s</span>
+          <button style={collapseBtn} onClick={onCollapse} title="Collapse">›</button>
+        </span>
       </div>
       <MeterBar label="Fall Risk" val={risk} color={riskClr} />
       <MeterBar label="Tower Lean" val={lean} color={leanClr} />
@@ -827,7 +880,7 @@ function StatsPanel({ matchStats, myId }) {
 function Panel({
   roomCode, status, myId, players, currentTurn, isSpectator,
   envType, matchStats, playerColorMap,
-  onCreate, onJoin, onLeave, onChangeEnv, onRebuild, onOpenSettings,
+  onCreate, onJoin, onLeave, onChangeEnv, onRebuild, onOpenSettings, onCollapse,
 }) {
   const [mode, setMode]   = useState(null); // null | "join" | "spectate"
   const [code, setCode]   = useState("");
@@ -844,7 +897,10 @@ function Panel({
 
   return (
     <div style={panel}>
-      <div style={ptitle}>JENGA</div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={ptitle}>JENGA</div>
+        <button style={collapseBtn} onClick={onCollapse} title="Collapse">‹</button>
+      </div>
       <div style={psub}>Worldwide · Firebase · Real Physics</div>
 
       {!inRoom ? (
@@ -924,13 +980,20 @@ export default function App() {
   const [draggingId, setDraggingId]     = useState(null);
   const [showSettings, setShowSettings] = useState(false);
 
+  // Collapsible side menus — auto-collapse on narrow/mobile screens
+  const isMobile = useMemo(() => typeof window !== "undefined" && window.innerWidth < 720, []);
+  const [panelOpen, setPanelOpen] = useState(!isMobile);
+  const [hudOpen,   setHudOpen]   = useState(!isMobile);
+
   const rbRefs   = useRef(new Map());
   const shakeRef = useRef(() => {});
+  const stabRef  = useRef(100);
   const prevRisk = useRef(0);
   const prevTurnRef = useRef(currentTurn);
 
   const { playTap, playPull, playCrash } = useAudio();
   const { stab, needsBtn, requestGyro }  = useGyro();
+  stabRef.current = stab; // live mirror so the drag loop can read it without re-subscribing
 
   const thawDelays = useMemo(() => {
     const d = {};
@@ -1013,12 +1076,17 @@ export default function App() {
 
   return (
     <div style={root}>
-      <Panel
-        roomCode={roomCode} status={status} myId={myId} players={players} currentTurn={currentTurn}
-        isSpectator={isSpectator} envType={envType} matchStats={matchStats} playerColorMap={playerColorMap}
-        onCreate={onCreate} onJoin={onJoinRoom} onLeave={onLeave}
-        onChangeEnv={changeEnv} onRebuild={triggerRebuild} onOpenSettings={() => setShowSettings(true)}
-      />
+      {panelOpen ? (
+        <Panel
+          roomCode={roomCode} status={status} myId={myId} players={players} currentTurn={currentTurn}
+          isSpectator={isSpectator} envType={envType} matchStats={matchStats} playerColorMap={playerColorMap}
+          onCreate={onCreate} onJoin={onJoinRoom} onLeave={onLeave}
+          onChangeEnv={changeEnv} onRebuild={triggerRebuild} onOpenSettings={() => setShowSettings(true)}
+          onCollapse={() => setPanelOpen(false)}
+        />
+      ) : (
+        <button style={{ ...reopenPill, top: 16, left: 16 }} onClick={() => setPanelOpen(true)}>☰ {roomCode ? "Room" : "Menu"}</button>
+      )}
 
       <Canvas shadows camera={{ position: [7, 9.5, 9], fov: 44 }} style={{ position: "absolute", inset: 0, zIndex: 0 }} gl={{ antialias: true }}>
         <Scene
@@ -1026,11 +1094,15 @@ export default function App() {
           gravity={gravity} levels={levels} envType={envType} active={active}
           lockedBlocks={lockedBlocks} playerColorMap={playerColorMap} myId={myId} draggingId={draggingId}
           onGrab={onGrab} onRelease={onRelease} onAnalyticsUpdate={setAnalytics}
-          shakeRef={shakeRef} orbitEnabled={orbitEnabled} setOrbitEnabled={setOrbitEnabled}
+          shakeRef={shakeRef} orbitEnabled={orbitEnabled} setOrbitEnabled={setOrbitEnabled} stabRef={stabRef}
         />
       </Canvas>
 
-      <HUD analytics={analytics} stab={stab} needsBtn={needsBtn} requestGyro={requestGyro} myTurn={myTurn} timeLeft={timeLeft} settled={settled} turnName={turnName} />
+      {hudOpen ? (
+        <HUD analytics={analytics} stab={stab} needsBtn={needsBtn} requestGyro={requestGyro} myTurn={myTurn} timeLeft={timeLeft} settled={settled} turnName={turnName} onCollapse={() => setHudOpen(false)} />
+      ) : (
+        <button style={{ ...reopenPill, bottom: 16, right: 16 }} onClick={() => setHudOpen(true)}>📊 Stats</button>
+      )}
 
       {roomCode && <ChatWindow chatMsgs={chatMsgs} onSend={sendChat} myId={myId} playerColorMap={playerColorMap} />}
 
@@ -1063,6 +1135,8 @@ const sr     = { display: "flex", justifyContent: "space-between", alignItems: "
 const dim    = { opacity: 0.5 };
 const lbl    = { display: "block", fontSize: 10, color: "#666", marginBottom: 4, marginTop: 8, textTransform: "uppercase", letterSpacing: 0.8 };
 const hlp    = { fontSize: 11, opacity: 0.4, lineHeight: 1.5, marginTop: 4 };
+const collapseBtn = { border: 0, background: "rgba(255,255,255,0.08)", color: "#f0d090", width: 24, height: 24, borderRadius: 7, cursor: "pointer", fontSize: 15, fontWeight: 800, lineHeight: 1, flexShrink: 0 };
+const reopenPill  = { position: "absolute", zIndex: 11, border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, padding: "9px 13px", background: "rgba(10,8,5,0.9)", backdropFilter: "blur(18px)", color: "#f0d090", fontWeight: 800, fontSize: 12, cursor: "pointer" };
 
 const hud    = { ...glass, position: "absolute", bottom: 16, right: 16, zIndex: 10, width: 220 };
 const hint   = { fontSize: 11, opacity: 0.42, lineHeight: 1.5, marginTop: 10 };
