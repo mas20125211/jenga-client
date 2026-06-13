@@ -339,10 +339,10 @@ function useFirebaseRoom(myId) {
       .sort(([, a], [, b]) => (a.joinedAt || 0) - (b.joinedAt || 0))
       .map(([id]) => id);
 
-  const createRoom = useCallback((code, extraSettings = {}) => {
+  const createRoom = useCallback((code, name = "", extraSettings = {}) => {
     const settings = { gravity: DEFAULT_GRAVITY, levels: DEFAULT_LEVELS, password: "", ...extraSettings };
     set(ref(db, `rooms/${code}`), {
-      hostId: myId, current: myId,
+      hostId: myId, current: myId, name: name || `${shortName(myId)}'s table`,
       players: { [myId]: { name: shortName(myId), joinedAt: Date.now(), isSpectator: false } },
       removed: {}, locked: {}, chat: {},
       iteration: 0, envType: "apartment", settings, stats: {}, createdAt: Date.now(),
@@ -1043,6 +1043,119 @@ function Panel({
   );
 }
 
+// ─── Title screen — Local vs Online ──────────────────────────────────────────────
+function TitleScreen({ onLocal, onOnline }) {
+  return (
+    <div style={titleWrap}>
+      <div style={titleCard}>
+        <div style={{ fontSize: 46, fontWeight: 900, letterSpacing: "0.18em", color: "#f0d090" }}>JENGA</div>
+        <div style={{ fontSize: 12, color: "#8a7a5a", margin: "4px 0 26px", letterSpacing: "0.08em" }}>REAL-PHYSICS TOWER · PLAY ANYWHERE</div>
+        <button style={{ ...bigBtn, background: "#4ade80", color: "#04210f" }} onClick={onLocal}>
+          🎮 Local<div style={bigSub}>One device · pass &amp; play</div>
+        </button>
+        <button style={{ ...bigBtn, background: "#1d4ed8", color: "#fff" }} onClick={onOnline}>
+          🌍 Online<div style={{ ...bigSub, color: "#cdd9ff" }}>Browse rooms · play worldwide</div>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Local game setup (pass-and-play) ────────────────────────────────────────────
+function LocalSetup({ onStart, onBack }) {
+  const [names, setNames] = useState(["Player 1", "Player 2"]);
+  const setName = (i, v) => setNames((n) => n.map((x, j) => (j === i ? v : x)));
+  return (
+    <div style={titleWrap}>
+      <div style={{ ...titleCard, width: 320 }}>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#f0d090", marginBottom: 2 }}>Local game</div>
+        <div style={{ fontSize: 12, color: "#888", marginBottom: 16 }}>Take turns on this one device.</div>
+        {names.map((n, i) => (
+          <div key={i} style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: P_COLORS[i % P_COLORS.length], flexShrink: 0 }} />
+            <input value={n} onChange={(e) => setName(i, e.target.value)} style={{ ...inp, flex: 1, letterSpacing: 0 }} />
+            {names.length > 2 && <button style={{ ...btn, width: 34, background: "#3f1010", color: "#fca5a5", padding: 0 }} onClick={() => setNames((p) => p.filter((_, j) => j !== i))}>×</button>}
+          </div>
+        ))}
+        {names.length < 4 && <button style={{ ...btn, background: "#1e293b", color: "#94a3b8", marginBottom: 8 }} onClick={() => setNames((p) => [...p, `Player ${p.length + 1}`])}>+ Add player</button>}
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <button style={btn} onClick={() => onStart(names.map((s) => s.trim() || "Player"))}>Start game</button>
+          <button style={{ ...btn, background: "#333", color: "#aaa" }} onClick={onBack}>Back</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Online room browser ─────────────────────────────────────────────────────────
+function useRoomList() {
+  const [rooms, setRooms] = useState([]);
+  useEffect(() => {
+    const unsub = onValue(ref(db, "rooms"), (snap) => {
+      const data = snap.val() || {};
+      setRooms(
+        Object.entries(data)
+          .map(([code, r]) => ({
+            code,
+            name: r?.name || code,
+            players: r?.players ? Object.values(r.players).filter(Boolean).length : 0,
+            locked: !!r?.settings?.password,
+            createdAt: r?.createdAt || 0,
+          }))
+          .filter((r) => r.players > 0)
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .slice(0, 25),
+      );
+    });
+    return () => unsub();
+  }, []);
+  return rooms;
+}
+
+function RoomBrowser({ onCreate, onJoin, onBack }) {
+  const rooms = useRoomList();
+  const [name, setName] = useState("");
+  const [pass, setPass] = useState("");
+  const [joinPass, setJoinPass] = useState({});
+  const [err, setErr] = useState("");
+
+  const doJoin = async (code) => {
+    const res = await onJoin(code, joinPass[code] || "", false);
+    if (res?.error) setErr(`${code}: ${res.error}`);
+  };
+
+  return (
+    <div style={titleWrap}>
+      <div style={{ ...titleCard, width: 384, maxHeight: "88vh", overflowY: "auto", alignItems: "stretch", textAlign: "left" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: "#f0d090" }}>🌍 Online</div>
+          <button style={{ ...btn, width: "auto", background: "#333", color: "#aaa", padding: "6px 12px" }} onClick={onBack}>← Back</button>
+        </div>
+
+        <div style={{ ...sec, marginBottom: 14 }}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name your room" style={{ ...inp, letterSpacing: 0 }} />
+          <input value={pass} onChange={(e) => setPass(e.target.value)} placeholder="Password (optional)" type="password" style={{ ...inp, letterSpacing: 0 }} />
+          <button style={btn} onClick={() => onCreate(name.trim(), pass)}>+ Create room</button>
+        </div>
+
+        <div style={{ fontSize: 10, color: "#666", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Open tables ({rooms.length})</div>
+        {err && <div style={{ color: "#f87171", fontSize: 11, marginBottom: 6 }}>{err}</div>}
+        {rooms.length === 0 && <div style={{ fontSize: 12, color: "#444", fontStyle: "italic" }}>No open rooms yet — create one above.</div>}
+        {rooms.map((r) => (
+          <div key={r.code} style={roomRow}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: "#eee", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.locked ? "🔒 " : ""}{r.name}</div>
+              <div style={{ fontSize: 10, color: "#777" }}>{r.code} · {r.players} player{r.players !== 1 ? "s" : ""}</div>
+            </div>
+            {r.locked && <input onChange={(e) => setJoinPass((p) => ({ ...p, [r.code]: e.target.value }))} placeholder="pw" type="password" style={{ ...inp, width: 52, padding: "5px 6px", letterSpacing: 0 }} />}
+            <button style={{ ...btn, width: "auto", padding: "6px 12px" }} onClick={() => doJoin(r.code)}>Join</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── App root ────────────────────────────────────────────────────────────────────
 export default function App() {
   const [myId] = useState(() => Math.random().toString(36).slice(2, 10));
@@ -1070,6 +1183,11 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(!isMobile);
   const [hudOpen,   setHudOpen]   = useState(!isMobile);
 
+  // Top-level view: title → choose Local (one device) or Online (room browser).
+  const [view, setView]                 = useState("title"); // title | localSetup | local | online
+  const [localPlayers, setLocalPlayers] = useState([]);      // pass-and-play names
+  const [localTurn, setLocalTurn]       = useState(0);
+
   const rbRefs   = useRef(new Map());
   const shakeRef = useRef(() => {});
   const stabRef  = useRef(100);
@@ -1092,13 +1210,20 @@ export default function App() {
     return m;
   }, [players]);
 
-  // myTurn: my turn in a room (not spectating), OR playing solo (no room)
-  const myTurn = (!roomCode || currentTurn === myId) && !isSpectator;
-  const active = myTurn && settled;
-  const turnName = players[currentTurn]?.name ?? currentTurn?.slice(0, 4) ?? "…";
-  // Physics authority = whoever's turn it is (they run the real sim + broadcast).
-  // Solo player is always authority; spectators never are.
-  const isAuthority = (!roomCode || currentTurn === myId) && !isSpectator;
+  const isLocal = view === "local";
+  const inGame  = isLocal || (view === "online" && !!roomCode);
+
+  // Local pass-and-play: it's always "your turn" (the device is shared); online:
+  // my turn in the room (not spectating). Authority/active derive from these.
+  const onlineMyTurn = (currentTurn === myId) && !isSpectator;
+  const myTurn = isLocal ? true : onlineMyTurn;
+  const active = inGame && myTurn && settled;
+  const turnName = isLocal
+    ? (localPlayers[localTurn] || "Player")
+    : (players[currentTurn]?.name ?? currentTurn?.slice(0, 4) ?? "…");
+  // Physics authority = whoever's turn it is. Local player is always authority;
+  // online it's the turn-holder; spectators never are.
+  const isAuthority = isLocal ? true : onlineMyTurn;
 
   const startSettle = useCallback((lv) => {
     setSettled(false);
@@ -1114,10 +1239,11 @@ export default function App() {
     startSettle(levels);
   }, [gameIteration, levels, startSettle]);
 
-  // Apply removed blocks from Firebase
+  // Apply removed blocks from Firebase (online only — local manages its own)
   useEffect(() => {
+    if (!roomCode) return;
     setBlocks((prev) => prev.map((b) => ({ ...b, removed: removedIds.includes(b.id) })));
-  }, [removedIds]);
+  }, [removedIds, roomCode]);
 
   // Visual timer — resets when Firebase pushes a new turn
   useEffect(() => {
@@ -1150,21 +1276,34 @@ export default function App() {
     if (wasPulled) {
       setBlocks((p) => p.map((b) => b.id === blockId ? { ...b, removed: true } : b)); // optimistic
       playPull();
-      if (roomCode) emitPulled(blockId);
+      if (isLocal) { setLocalTurn((t) => (localPlayers.length ? (t + 1) % localPlayers.length : 0)); setTimeLeft(TURN_SEC); }
+      else if (roomCode) emitPulled(blockId);
       else setTimeLeft(TURN_SEC);
-    } else {
+    } else if (!isLocal) {
       unlockBlock(blockId);
     }
-  }, [roomCode, emitPulled, unlockBlock, playPull]);
+  }, [isLocal, localPlayers.length, roomCode, emitPulled, unlockBlock, playPull]);
+
+  // ── View / mode actions ──
+  const startLocal = useCallback((names) => {
+    setLocalPlayers(names); setLocalTurn(0); setView("local");
+    setBlocks(buildBlocks(DEFAULT_LEVELS)); setDraggingId(null); startSettle(DEFAULT_LEVELS);
+  }, [startSettle]);
+  const exitToTitle = useCallback(() => {
+    if (roomCode) leaveRoom();
+    setView("title"); setLocalPlayers([]); setLocalTurn(0);
+    setBlocks(buildBlocks(DEFAULT_LEVELS)); startSettle(DEFAULT_LEVELS);
+  }, [roomCode, leaveRoom, startSettle]);
 
   // ── Lobby actions ──
-  const onCreate = useCallback(() => { createRoom(makeCode()); }, [createRoom]);
+  const onCreate = useCallback((name = "", password = "") => { createRoom(makeCode(), name, { password }); }, [createRoom]);
   const onJoinRoom = useCallback((code, pass, spectator) => joinRoom(code, pass, spectator), [joinRoom]);
   const onLeave = useCallback(() => { leaveRoom(); setBlocks(buildBlocks(DEFAULT_LEVELS)); startSettle(DEFAULT_LEVELS); setTimeLeft(TURN_SEC); }, [leaveRoom, startSettle]);
 
   return (
     <div style={root}>
-      {panelOpen ? (
+      {/* In-room controls (online) */}
+      {view === "online" && roomCode && (panelOpen ? (
         <Panel
           roomCode={roomCode} status={status} myId={myId} players={players} currentTurn={currentTurn}
           isSpectator={isSpectator} envType={envType} matchStats={matchStats} playerColorMap={playerColorMap}
@@ -1173,8 +1312,33 @@ export default function App() {
           onCollapse={() => setPanelOpen(false)}
         />
       ) : (
-        <button style={{ ...reopenPill, top: 16, left: 16 }} onClick={() => setPanelOpen(true)}>☰ {roomCode ? "Room" : "Menu"}</button>
-      )}
+        <button style={{ ...reopenPill, top: 16, left: 16 }} onClick={() => setPanelOpen(true)}>☰ Room</button>
+      ))}
+
+      {/* Local pass-and-play controls */}
+      {isLocal && (panelOpen ? (
+        <div style={panel}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={ptitle}>JENGA</div>
+            <button style={collapseBtn} onClick={() => setPanelOpen(false)} title="Collapse">‹</button>
+          </div>
+          <div style={psub}>Local · pass &amp; play</div>
+          <div style={sec}>
+            {localPlayers.map((n, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12 }}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: P_COLORS[i % P_COLORS.length] }} />
+                <span style={{ color: i === localTurn ? "#4ade80" : "#aaa", fontWeight: i === localTurn ? 800 : 500 }}>{n}</span>
+                {i === localTurn && <span style={{ color: "#f0d090", marginLeft: "auto" }}>◀ turn</span>}
+              </div>
+            ))}
+          </div>
+          <button style={{ ...btn, background: "#7f1d1d", color: "#fca5a5", marginBottom: 7 }}
+            onClick={() => { setBlocks(buildBlocks(DEFAULT_LEVELS)); setDraggingId(null); startSettle(DEFAULT_LEVELS); }}>↺ Rebuild Tower</button>
+          <button style={{ ...btn, background: "#333", color: "#aaa" }} onClick={exitToTitle}>⏏ Exit to title</button>
+        </div>
+      ) : (
+        <button style={{ ...reopenPill, top: 16, left: 16 }} onClick={() => setPanelOpen(true)}>☰ Menu</button>
+      ))}
 
       <Canvas shadows camera={{ position: [7, 9.5, 9], fov: 44 }} style={{ position: "absolute", inset: 0, zIndex: 0 }} gl={{ antialias: true }}>
         <Scene
@@ -1187,17 +1351,17 @@ export default function App() {
         />
       </Canvas>
 
-      {hudOpen ? (
+      {inGame && (hudOpen ? (
         <HUD analytics={analytics} stab={stab} needsBtn={needsBtn} requestGyro={requestGyro} myTurn={myTurn} timeLeft={timeLeft} settled={settled} turnName={turnName} onCollapse={() => setHudOpen(false)} />
       ) : (
         <button style={{ ...reopenPill, bottom: 16, right: 16 }} onClick={() => setHudOpen(true)}>📊 Stats</button>
-      )}
+      ))}
 
-      {roomCode && <ChatWindow chatMsgs={chatMsgs} onSend={sendChat} myId={myId} playerColorMap={playerColorMap} />}
+      {view === "online" && roomCode && <ChatWindow chatMsgs={chatMsgs} onSend={sendChat} myId={myId} playerColorMap={playerColorMap} />}
 
       {showSettings && <SettingsModal settings={roomSettings} onSave={updateSettings} onClose={() => setShowSettings(false)} isHost={isHost} />}
 
-      {!settled && (
+      {inGame && !settled && (
         <div style={ovl}>
           <div style={ovlBox}>
             <div style={ovlTitle}>Stacking blocks…</div>
@@ -1206,6 +1370,11 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ── Top-level views ── */}
+      {view === "title" && <TitleScreen onLocal={() => setView("localSetup")} onOnline={() => setView("online")} />}
+      {view === "localSetup" && <LocalSetup onStart={startLocal} onBack={() => setView("title")} />}
+      {view === "online" && !roomCode && <RoomBrowser onCreate={onCreate} onJoin={onJoinRoom} onBack={exitToTitle} />}
     </div>
   );
 }
@@ -1226,6 +1395,12 @@ const lbl    = { display: "block", fontSize: 10, color: "#666", marginBottom: 4,
 const hlp    = { fontSize: 11, opacity: 0.4, lineHeight: 1.5, marginTop: 4 };
 const collapseBtn = { border: 0, background: "rgba(255,255,255,0.08)", color: "#f0d090", width: 24, height: 24, borderRadius: 7, cursor: "pointer", fontSize: 15, fontWeight: 800, lineHeight: 1, flexShrink: 0 };
 const reopenPill  = { position: "absolute", zIndex: 11, border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, padding: "9px 13px", background: "rgba(10,8,5,0.9)", backdropFilter: "blur(18px)", color: "#f0d090", fontWeight: 800, fontSize: 12, cursor: "pointer" };
+
+const titleWrap = { position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(4,3,2,0.55)", backdropFilter: "blur(7px)" };
+const titleCard = { ...glass, width: 300, padding: 28, display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center" };
+const bigBtn    = { width: "100%", border: 0, borderRadius: 12, padding: "14px 16px", fontWeight: 900, fontSize: 17, cursor: "pointer", marginBottom: 12 };
+const bigSub    = { fontSize: 11, fontWeight: 600, opacity: 0.85, marginTop: 3 };
+const roomRow   = { display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 9, background: "rgba(255,255,255,0.04)", marginBottom: 6 };
 
 const hud    = { ...glass, position: "absolute", bottom: 16, right: 16, zIndex: 10, width: 220 };
 const hint   = { fontSize: 11, opacity: 0.42, lineHeight: 1.5, marginTop: 10 };
