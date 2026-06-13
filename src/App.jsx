@@ -374,7 +374,7 @@ const Block = React.memo(function Block({
   block, rbRefs, thawDelay,
   isHost, remoteState,
   isInteractable, isSelected, lockedByColor,
-  onSelect,
+  onSelect, controlsRef,
 }) {
   const rbRef  = useRef(null);
   const [hov, setHov] = useState(false);
@@ -420,11 +420,14 @@ const Block = React.memo(function Block({
     const hit = new THREE.Vector3();
     if (!raycaster.ray.intersectPlane(plane, hit)) return;
 
-    rb.setTranslation({
+    const next = {
       x: hit.x - dragRef.current.offset.x,
       y: dragRef.current.y,
       z: hit.z - dragRef.current.offset.z,
-    }, true);
+    };
+
+    // Kinematic bodies respond more reliably to next-translation updates.
+    rb.setNextKinematicTranslation(next);
     rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
     rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
   }, [camera, gl, raycaster]);
@@ -443,6 +446,8 @@ const Block = React.memo(function Block({
   useEffect(() => {
     if (!isDragging) return;
 
+    if (controlsRef?.current) controlsRef.current.enabled = false;
+
     const onMove = (ev) => {
       const dx = ev.clientX - dragRef.current.startX;
       const dy = ev.clientY - dragRef.current.startY;
@@ -450,18 +455,22 @@ const Block = React.memo(function Block({
       moveToPointer(ev.clientX, ev.clientY);
     };
 
-    const onUp = () => {
+    const stopDrag = () => {
       setIsDragging(false);
+      if (controlsRef?.current) controlsRef.current.enabled = true;
       document.body.style.cursor = "default";
     };
 
     window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointerup", stopDrag);
+    window.addEventListener("pointercancel", stopDrag);
     return () => {
       window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointerup", stopDrag);
+      window.removeEventListener("pointercancel", stopDrag);
+      if (controlsRef?.current) controlsRef.current.enabled = true;
     };
-  }, [isDragging, moveToPointer]);
+  }, [isDragging, moveToPointer, controlsRef]);
 
   useEffect(() => () => {
     if (document.body.style.cursor === "grabbing") document.body.style.cursor = "default";
@@ -507,6 +516,7 @@ const Block = React.memo(function Block({
           e.stopPropagation();
           if (!canAct || !isSelected || !rbRef.current) return;
 
+          e.target.setPointerCapture?.(e.pointerId);
           const pos = rbRef.current.translation();
           dragRef.current.offset.set(e.point.x - pos.x, 0, e.point.z - pos.z);
           dragRef.current.y = pos.y;
@@ -515,6 +525,15 @@ const Block = React.memo(function Block({
           dragRef.current.moved = false;
           setIsDragging(true);
           document.body.style.cursor = "grabbing";
+        }}
+        onPointerMove={(e) => {
+          if (!isDragging) return;
+          e.stopPropagation();
+        }}
+        onPointerUp={(e) => {
+          if (!isDragging) return;
+          e.stopPropagation();
+          e.target.releasePointerCapture?.(e.pointerId);
         }}
         onClick={(e) => {
           e.stopPropagation();
@@ -657,7 +676,7 @@ function Scene({
   blocks, rbRefs, thawDelays, gameIteration,
   envType, isHost, remoteBlockStates, pushBlockStates,
   isMyTurn, lockedBlocks, playerColorMap, selectedBlock, onSelectBlock,
-  onAnalyticsUpdate, shakeRef, gravity,
+  onAnalyticsUpdate, shakeRef, gravity, controlsRef,
 }) {
   const env        = ENVS[envType] || ENVS.apartment;
   const totalBlks  = blocks.length;
@@ -708,6 +727,7 @@ function Scene({
             isSelected={selectedBlock === b.id}
             lockedByColor={lockedBlocks[b.id] ? playerColorMap[lockedBlocks[b.id]] : null}
             onSelect={onSelectBlock}
+            controlsRef={controlsRef}
           />
         ))}
 
@@ -725,6 +745,7 @@ function Scene({
       <ContactShadows position={[0, 0.005, 0]} opacity={0.42} scale={12} blur={2.5} />
       <CameraShake triggerRef={shakeRef} />
       <OrbitControls
+        ref={controlsRef}
         makeDefault
         minDistance={5}
         maxDistance={22}
@@ -931,6 +952,7 @@ export default function App() {
 
   const rbRefs   = useRef(new Map());
   const shakeRef = useRef(() => {});
+  const controlsRef = useRef(null);
   const prevRisk = useRef(0);
 
   const { playTap, playPull, playCrash } = useAudio();
@@ -1180,6 +1202,7 @@ export default function App() {
           onAnalyticsUpdate={setAnalytics}
           shakeRef={shakeRef}
           gravity={gravity}
+          controlsRef={controlsRef}
         />
       </Canvas>
     </div>
