@@ -378,7 +378,19 @@ const Block = React.memo(function Block({
 }) {
   const rbRef  = useRef(null);
   const [hov, setHov] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragRef = useRef({
+    offset: new THREE.Vector3(),
+    y: 0,
+    startX: 0,
+    startY: 0,
+    moved: false,
+  });
   const tex = woodTex();
+  const { camera, gl } = useThree();
+  const raycaster = useMemo(() => new THREE.Raycaster(), []);
+
+  const canAct = isInteractable && !lockedByColor;
 
   // Register ref
   useEffect(() => {
@@ -393,6 +405,30 @@ const Block = React.memo(function Block({
     return () => clearTimeout(t);
   }, [thawDelay, isHost]);
 
+  const moveToPointer = useCallback((clientX, clientY) => {
+    const rb = rbRef.current;
+    if (!rb) return;
+
+    const rect = gl.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -(((clientY - rect.top) / rect.height) * 2 - 1),
+    );
+
+    raycaster.setFromCamera(ndc, camera);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -dragRef.current.y);
+    const hit = new THREE.Vector3();
+    if (!raycaster.ray.intersectPlane(plane, hit)) return;
+
+    rb.setTranslation({
+      x: hit.x - dragRef.current.offset.x,
+      y: dragRef.current.y,
+      z: hit.z - dragRef.current.offset.z,
+    }, true);
+    rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }, [camera, gl, raycaster]);
+
   // Clients: apply kinematic transform from Firebase
   useFrame(() => {
     if (isHost || !remoteState || !rbRef.current) return;
@@ -404,9 +440,35 @@ const Block = React.memo(function Block({
     });
   });
 
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - dragRef.current.startX;
+      const dy = ev.clientY - dragRef.current.startY;
+      if (Math.hypot(dx, dy) > 4) dragRef.current.moved = true;
+      moveToPointer(ev.clientX, ev.clientY);
+    };
+
+    const onUp = () => {
+      setIsDragging(false);
+      document.body.style.cursor = "default";
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [isDragging, moveToPointer]);
+
+  useEffect(() => () => {
+    if (document.body.style.cursor === "grabbing") document.body.style.cursor = "default";
+  }, []);
+
   if (block.removed) return null;
 
-  const canAct    = isInteractable && !lockedByColor;
   const emissive  = isSelected ? "#704810" : hov && canAct ? "#2a1005" : "#000000";
   const emissiveI = isSelected ? 0.5 : hov && canAct ? 0.25 : 0;
   const tintColor = lockedByColor ?? "#c47a3a";
@@ -434,15 +496,32 @@ const Block = React.memo(function Block({
         onPointerOver={(e) => {
           e.stopPropagation();
           setHov(true);
-          document.body.style.cursor = canAct ? "pointer" : "not-allowed";
+          document.body.style.cursor = isDragging ? "grabbing" : canAct ? "pointer" : "not-allowed";
         }}
         onPointerOut={(e) => {
           e.stopPropagation();
           setHov(false);
-          document.body.style.cursor = "default";
+          if (!isDragging) document.body.style.cursor = "default";
+        }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (!canAct || !isSelected || !rbRef.current) return;
+
+          const pos = rbRef.current.translation();
+          dragRef.current.offset.set(e.point.x - pos.x, 0, e.point.z - pos.z);
+          dragRef.current.y = pos.y;
+          dragRef.current.startX = e.clientX;
+          dragRef.current.startY = e.clientY;
+          dragRef.current.moved = false;
+          setIsDragging(true);
+          document.body.style.cursor = "grabbing";
         }}
         onClick={(e) => {
           e.stopPropagation();
+          if (dragRef.current.moved) {
+            dragRef.current.moved = false;
+            return;
+          }
           if (canAct) onSelect(block.id);
         }}
       >
@@ -1028,7 +1107,7 @@ export default function App() {
                 border: "1px solid rgba(74,222,128,0.25)",
                 borderRadius: 6, fontSize: 11, color: "#4ade80",
               }}>
-                Block selected — click again to pull
+                Block selected — click again to pull, or drag it first
               </div>
             )}
 
