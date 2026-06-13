@@ -35,7 +35,7 @@ const ROOM_LEN  = 4;
 const TURN_SEC  = 30;
 
 // Physics — heavy wood, zero bounce
-const GRAVITY     = -24;
+const GRAVITY     = -12;
 const FRICTION    = 0.95;
 const RESTITUTION = 0.0;
 const LIN_DAMP    = 5.5;
